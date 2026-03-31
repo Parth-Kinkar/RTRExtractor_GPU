@@ -1,13 +1,13 @@
 CXX=g++
 CXXFLAGS=-O2 -std=c++11 -fopenmp -Iinclude
 NVCC=nvcc
-NVCCFLAGS=-gencode=arch=compute_61,code=sm_61 -O2 -std=c++11 -Iinclude -rdc=true 
+NVCCFLAGS=-arch=native -O2 -std=c++11 -Iinclude -rdc=true 
 
 
 all : tric_gpu
 
 tric_gpu : main.o tricount_gpu.o log.o gpu.o
-	$(CXX) $(CXXFLAGS) -o tric_gpu main.o tricount_gpu.o log.o gpu.o -L /usr/local/cuda/lib64 -lcudart -lcudadevrt 
+	$(NVCC) $(NVCCFLAGS) -Xcompiler "-fopenmp" -o tric_gpu main.o tricount_gpu.o log.o gpu.o
 
 main.o : src/main.cpp
 	$(CXX) $(CXXFLAGS) -c src/main.cpp -o main.o

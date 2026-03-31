@@ -1,5 +1,6 @@
 #include <vector>
 #include <cstring>
+#include <cuda_runtime.h>
 
 #include "log.h"
 #include "util.h"
@@ -33,7 +34,7 @@ int main(int argc, char *argv[]) {
 
     log_info(read_file.start());
 
-    ReadFile readFile(getFileName(argc, argv).c_str());
+    ReadFile readFile(argv[1]);
 
     if (readFile.getLen() % sizeof(uint64_t)) {
         log_error("file size error: cannot be divided by 8");
@@ -69,7 +70,7 @@ int main(int argc, char *argv[]) {
     redirect_edges(edges, edge_count, deg, node_count);
     log_info(preprocess.count("redirect_edges"));
 
-    free(deg);
+    // free(deg);
     log_info(preprocess.count("free deg"));
 
     uint64_t part_num = cal_part_num(edges, edge_count, node_count);

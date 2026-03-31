@@ -21,12 +21,13 @@
     }                                                                           \
   } while (0)
 
-const int numBlocks = 1048576;
+const int numBlocks = 65536;
 const int BLOCKSIZE = 512;//1024;
 
 uint64_t gpu_mem;
 
 uint64_t init_gpu() {
+    cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 512 * 1024 * 1024);
     cudaDeviceProp deviceProp{};
     CUDA_TRY(cudaGetDeviceProperties(&deviceProp, 0));
     gpu_mem = deviceProp.totalGlobalMem;
@@ -284,10 +285,120 @@ __global__ void warp_binary_kernel(const uint32_t* __restrict__ edge_m, const ui
             }
             j += 32;
         }
+    // 1. Squeeze the partial counts
+        uint64_t warp_sum = count;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+        }
+
+        // 2. Thread 0 saves the exact edge weight directly into the VRAM array!
+        if (i == 0) {
+            results[tid] = warp_sum; 
+        }
+        
+        // 3. CRITICAL FIX: Reset the count to 0 for the next edge in the loop!
+        count = 0;
         __syncthreads();
     }
-    results[blockDim.x * blockIdx.x + threadIdx.x] = count;
+    // results[blockDim.x * blockIdx.x + threadIdx.x] = count;
 }
+
+// =========================================================================
+// >>> CUSTOM HETEROGENEOUS PEELING ARCHITECTURE <<<
+// =========================================================================
+
+__global__ void checker_kernel(
+    const uint32_t* edge_m,
+    const uint32_t* adj_m,
+    const uint32_t* node_index,
+    const uint64_t* tri_counts,
+    bool* is_active,
+    bool* just_deleted,
+    float eps,
+    uint32_t edge_count,
+    bool* d_changed
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= edge_count) return;
+    if (!is_active[i]) return;
+
+    uint32_t u = edge_m[i];
+    uint32_t v = adj_m[i];
+
+    // Calculate degrees instantly from CSR pointers!
+    uint32_t deg_u = node_index[u+1] - node_index[u];
+    uint32_t deg_v = node_index[v+1] - node_index[v];
+
+    float threshold = eps * (deg_u + deg_v);
+
+    if (tri_counts[i] < threshold) {
+        is_active[i] = false;
+        just_deleted[i] = true;
+        *d_changed = true;
+    }
+}
+
+__global__ void updater_kernel(
+    const uint32_t* edge_m,
+    const uint32_t* adj_m,
+    const uint32_t* node_index,
+    uint64_t* tri_counts,
+    bool* is_active,
+    bool* just_deleted,
+    uint32_t edge_count
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= edge_count) return;
+    if (!just_deleted[i]) return;
+
+    uint32_t u = edge_m[i];
+    uint32_t v = adj_m[i];
+
+    // Grab the start and end pointers for u and v's neighborhood lists in VRAM
+    uint32_t ptr_u = node_index[u];
+    uint32_t end_u = node_index[u+1];
+    
+    uint32_t ptr_v = node_index[v];
+    uint32_t end_v = node_index[v+1];
+
+    // >>> THE WARP DIVERGENCE ZONE <<<
+    // 2-Pointer Intersection to find common neighbor w
+    while (ptr_u < end_u && ptr_v < end_v) {
+        uint32_t w_u = adj_m[ptr_u];
+        uint32_t w_v = adj_m[ptr_v];
+
+        if (w_u == w_v) {
+            // We found a triangle (u, v, w)! 
+            // Because of CSR, ptr_u and ptr_v are the EXACT indices for edges (u,w) and (v,w)
+            
+            // Atomically decrement edge (u,w) if it's still alive
+            if (is_active[ptr_u] && tri_counts[ptr_u] > 0) {
+                atomicAdd((unsigned long long int*)&tri_counts[ptr_u], -1ULL);
+            }
+            // Atomically decrement edge (v,w) using 64-bit 2's complement addition
+            if (is_active[ptr_v] && tri_counts[ptr_v] > 0) {
+                atomicAdd((unsigned long long int*)&tri_counts[ptr_v], -1ULL);
+            }
+            
+            ptr_u++;
+            ptr_v++;
+        } 
+        else if (w_u < w_v) {
+            ptr_u++;
+        } 
+        else {
+            ptr_v++;
+        }
+    }
+
+    // Reset the flag so we don't double-subtract in the next loop!
+    just_deleted[i] = false; 
+}
+
+
+
+
 __global__ void warp_intersection_kernel(const uint32_t* __restrict__ edge_m, 
 										 const uint32_t* __restrict__ node_index_m, 
 										 uint32_t edge_m_count, 
@@ -373,28 +484,30 @@ uint64_t tricount_gpu(uint64_t part_num, uint32_t *adj, const uint64_t *adj_coun
             CUDA_TRY(cudaMalloc((void **) &adj_n_dev, adj_count_n * sizeof(uint32_t)));
             CUDA_TRY(cudaMemcpy(adj_n_dev, adj_n, adj_count_n * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-            CUDA_TRY(cudaMalloc((void **) &dev_results, n_result * sizeof(uint64_t)));
+            CUDA_TRY(cudaMalloc((void **) &dev_results, adj_count_m * sizeof(uint64_t)));
 //            log_info("tricount_gpu_edge_kernel start");
             warp_binary_kernel<<<numBlocks, BLOCKSIZE>>>(edge_m_dev, node_index_m_dev, adj_count_m, adj_m_dev, start_node_n, node_index_n_dev, node_index_n_count, adj_n_dev, dev_results);
             CUDA_TRY(cudaDeviceSynchronize());
 //            log_info("tricount_gpu_edge_kernel end");
+
+            // --- BUG FIX: Reduce only up to adj_count_m to prevent segfault! ---
             thrust::device_ptr<uint64_t> ptr(dev_results);
-            uint64_t sum = thrust::reduce(ptr, ptr + n_result);
+            uint64_t sum = thrust::reduce(ptr, ptr + adj_count_m); 
             log_info("m: %d n: %d sum: %lu", m, n, sum);
             all_sum += sum;
+
+            // ====================================================================
+            // >>> HETEROGENEOUS HANDOFF: LAUNCH NATIVE GPU PEELING <<<
+            // ====================================================================
+            if (m == 0 && n == 0) { // Ensures this fires on the primary graph
+                float eps = 0.1f;
+                // Launch the wrapper we built earlier!
+                execute_gpu_peeling(edge_m_dev, adj_m_dev, node_index_m_dev, dev_results, adj_count_m, eps);
+            }
+            // ====================================================================
+
             if (m != n) {
                 CUDA_TRY(cudaMalloc((void **) &edge_n_dev, adj_count_n * sizeof(uint32_t)));
-                node_index_reconstruct_kernel<<<numBlocks, BLOCKSIZE>>>(edge_n_dev, node_index_n_dev, node_index_n_count);
-                CUDA_TRY(cudaDeviceSynchronize());
-//                log_info("tricount_gpu_edge_kernel start");
-                warp_binary_kernel<<<numBlocks, BLOCKSIZE>>>(edge_n_dev, node_index_n_dev, adj_count_n, adj_n_dev, start_node_m, node_index_m_dev, node_index_m_count, adj_m_dev, dev_results);
-                CUDA_TRY(cudaDeviceSynchronize());
-//                log_info("tricount_gpu_edge_kernel end");
-                thrust::device_ptr<uint64_t> ptr_n(dev_results);
-                sum = thrust::reduce(ptr_n, ptr_n + n_result);
-                log_info("m: %d n: %d sum: %lu", n, m, sum);
-                all_sum += sum;
-                CUDA_TRY(cudaFree(edge_n_dev));
             }
             CUDA_TRY(cudaFree(node_index_n_dev));
             CUDA_TRY(cudaFree(adj_n_dev));
@@ -405,4 +518,65 @@ uint64_t tricount_gpu(uint64_t part_num, uint32_t *adj, const uint64_t *adj_coun
         CUDA_TRY(cudaFree(edge_m_dev));
     }
     return all_sum;
+}
+void execute_gpu_peeling(
+    const uint32_t* dev_edge_m,
+    const uint32_t* dev_adj_m,
+    const uint32_t* dev_node_index,
+    uint64_t* dev_tri_counts,
+    uint32_t edge_count,
+    float eps
+) {
+    printf("\n>>> INITIATING PURE GPU PEELING LOOP <<<\n");
+
+    bool *dev_is_active, *dev_just_deleted, *dev_changed;
+    CUDA_TRY(cudaMalloc((void**)&dev_is_active, edge_count * sizeof(bool)));
+    CUDA_TRY(cudaMalloc((void**)&dev_just_deleted, edge_count * sizeof(bool)));
+    CUDA_TRY(cudaMalloc((void**)&dev_changed, sizeof(bool)));
+
+    CUDA_TRY(cudaMemset(dev_is_active, 1, edge_count * sizeof(bool)));
+    CUDA_TRY(cudaMemset(dev_just_deleted, 0, edge_count * sizeof(bool)));
+
+    int threads = 512;
+    int blocks = (edge_count + threads - 1) / threads;
+
+    bool host_changed = true;
+    int iteration = 0;
+
+    while (host_changed) {
+        iteration++;
+        host_changed = false;
+        
+        CUDA_TRY(cudaMemcpy(dev_changed, &host_changed, sizeof(bool), cudaMemcpyHostToDevice));
+
+        checker_kernel<<<blocks, threads>>>(
+            dev_edge_m, dev_adj_m, dev_node_index, dev_tri_counts, dev_is_active, dev_just_deleted, eps, edge_count, dev_changed
+        );
+        CUDA_TRY(cudaDeviceSynchronize());
+
+        CUDA_TRY(cudaMemcpy(&host_changed, dev_changed, sizeof(bool), cudaMemcpyDeviceToHost));
+
+        if (host_changed) {
+            updater_kernel<<<blocks, threads>>>(
+                dev_edge_m, dev_adj_m, dev_node_index, dev_tri_counts, dev_is_active, dev_just_deleted, edge_count
+            );
+            CUDA_TRY(cudaDeviceSynchronize());
+            printf("Iteration %d: Masked edges virtually deleted. Cascading updates triggered.\n", iteration);
+        } else {
+            printf("Iteration %d: Graph stabilized. Peeling complete.\n", iteration);
+        }
+    }
+    thrust::device_ptr<bool> mask_ptr(dev_is_active);
+    int surviving_edges = thrust::count(mask_ptr, mask_ptr + edge_count, true);
+    int deleted_edges = edge_count - surviving_edges;
+    
+    printf("\n--- PEELING VERIFICATION STATS ---\n");
+    printf("Original Edges: %u\n", edge_count);
+    printf("Deleted Edges:  %d\n", deleted_edges);
+    printf("Surviving Edges: %d\n", surviving_edges);
+    printf("----------------------------------\n\n");
+
+    CUDA_TRY(cudaFree(dev_is_active));
+    CUDA_TRY(cudaFree(dev_just_deleted));
+    CUDA_TRY(cudaFree(dev_changed));
 }
