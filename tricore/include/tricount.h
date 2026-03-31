@@ -31,5 +31,6 @@ void execute_gpu_peeling(
     const uint32_t* dev_node_index,
     uint64_t* dev_tri_counts,
     uint32_t edge_count,
-    float eps
+    uint32_t node_count,
+    double eps
 );

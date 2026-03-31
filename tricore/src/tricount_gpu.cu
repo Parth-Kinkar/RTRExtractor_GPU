@@ -13,6 +13,58 @@
 
 #include "util.h"
 
+struct UndirEdge {
+    uint32_t neighbor;
+    uint32_t edge_id;
+    bool operator<(const UndirEdge& other) const {
+        return neighbor < other.neighbor;
+    }
+};
+
+// Option A: The CPU Builder for Bidirectional Edge Mapping
+void build_undirected_csr_cpu(
+    const uint32_t* dag_edge_m,
+    const uint32_t* dag_adj_m,
+    uint32_t edge_count,
+    uint32_t node_count,
+    uint32_t** out_undir_node_index,
+    uint32_t** out_undir_adj,
+    uint32_t** out_undir_edge_id
+) {
+    printf(">>> CPU: Building Undirected Mapping CSR...\n");
+    std::vector<std::vector<UndirEdge>> adj_list(node_count);
+
+    // 1. Map both forward AND reverse edges, tied to the exact DAG Edge ID
+    for (uint32_t i = 0; i < edge_count; i++) {
+        uint32_t u = dag_edge_m[i];
+        uint32_t v = dag_adj_m[i];
+        adj_list[u].push_back({v, i}); // Forward edge
+        adj_list[v].push_back({u, i}); // The missing reverse edge!
+    }
+
+    // 2. Allocate the host arrays (2x size because undirected)
+    *out_undir_node_index = (uint32_t*)malloc((node_count + 1) * sizeof(uint32_t));
+    *out_undir_adj = (uint32_t*)malloc(2 * edge_count * sizeof(uint32_t));
+    *out_undir_edge_id = (uint32_t*)malloc(2 * edge_count * sizeof(uint32_t));
+
+    // 3. Flatten and sort into strict CSR format
+    uint32_t current_offset = 0;
+    for (uint32_t i = 0; i < node_count; i++) {
+        (*out_undir_node_index)[i] = current_offset;
+        
+        // Sorting is MANDATORY so the GPU 2-pointer intersection doesn't break
+        std::sort(adj_list[i].begin(), adj_list[i].end());
+        
+        for (const auto& edge : adj_list[i]) {
+            (*out_undir_adj)[current_offset] = edge.neighbor;
+            (*out_undir_edge_id)[current_offset] = edge.edge_id;
+            current_offset++;
+        }
+    }
+    (*out_undir_node_index)[node_count] = current_offset;
+    printf(">>> CPU: Undirected Mapping Built Successfully.\n");
+}
+
 #define CUDA_TRY(call)                                                          \
   do {                                                                          \
     cudaError_t const status = (call);                                          \
@@ -304,20 +356,48 @@ __global__ void warp_binary_kernel(const uint32_t* __restrict__ edge_m, const ui
     // results[blockDim.x * blockIdx.x + threadIdx.x] = count;
 }
 
-// =========================================================================
-// >>> CUSTOM HETEROGENEOUS PEELING ARCHITECTURE <<<
-// =========================================================================
+// 1. EXACT FRACTIONAL INITIALIZATION
+__global__ void init_exact_weights_kernel(
+    const uint32_t* edge_m, const uint32_t* adj_m,
+    const uint32_t* undir_node_index, const uint32_t* undir_adj,
+    double* exact_tri_counts, uint32_t edge_count // <-- NOW DOUBLE
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= edge_count) return;
 
+    uint32_t u = edge_m[i];
+    uint32_t v = adj_m[i];
+
+    uint32_t ptr_u = undir_node_index[u];
+    uint32_t end_u = undir_node_index[u+1];
+    uint32_t ptr_v = undir_node_index[v];
+    uint32_t end_v = undir_node_index[v+1];
+
+    double deg_u = (double)(end_u - ptr_u);
+    double deg_v = (double)(end_v - ptr_v);
+
+    double weight_sum = 0.0;
+    while (ptr_u < end_u && ptr_v < end_v) {
+        uint32_t w_u = undir_adj[ptr_u];
+        uint32_t w_v = undir_adj[ptr_v];
+
+        if (w_u == w_v) {
+            double deg_w = (double)(undir_node_index[w_u+1] - undir_node_index[w_u]);
+            weight_sum += 1.0 / (deg_u * deg_v * deg_w); // CPU's exact weight!
+            ptr_u++; ptr_v++;
+        } 
+        else if (w_u < w_v) ptr_u++;
+        else ptr_v++;
+    }
+    exact_tri_counts[i] = weight_sum;
+}
+
+// 2. EXACT FRACTIONAL THRESHOLD CHECKER
 __global__ void checker_kernel(
-    const uint32_t* edge_m,
-    const uint32_t* adj_m,
-    const uint32_t* node_index,
-    const uint64_t* tri_counts,
-    bool* is_active,
-    bool* just_deleted,
-    float eps,
-    uint32_t edge_count,
-    bool* d_changed
+    const uint32_t* edge_m, const uint32_t* adj_m,
+    const uint32_t* node_index, const double* tri_counts, // <-- NOW DOUBLE
+    bool* is_active, bool* just_deleted,
+    double eps, uint32_t edge_count, bool* d_changed
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= edge_count) return;
@@ -326,27 +406,27 @@ __global__ void checker_kernel(
     uint32_t u = edge_m[i];
     uint32_t v = adj_m[i];
 
-    // Calculate degrees instantly from CSR pointers!
-    uint32_t deg_u = node_index[u+1] - node_index[u];
-    uint32_t deg_v = node_index[v+1] - node_index[v];
+    double deg_u = (double)(node_index[u+1] - node_index[u]);
+    double deg_v = (double)(node_index[v+1] - node_index[v]);
+    
+    // THE CPU EXACT JACCARD THRESHOLD
+    double edgeWt = 1.0 / (deg_u * deg_v);
+    double threshold = eps * edgeWt;
 
-    float threshold = eps * (deg_u + deg_v);
-
-    if (tri_counts[i] < threshold) {
+    // We keep a microscopic armor just to prevent IEEE float mismatches
+    if (tri_counts[i] < threshold - 1e-9) {
         is_active[i] = false;
         just_deleted[i] = true;
         *d_changed = true;
     }
 }
 
+// 3. EXACT FRACTIONAL UPDATER
 __global__ void updater_kernel(
-    const uint32_t* edge_m,
-    const uint32_t* adj_m,
-    const uint32_t* node_index,
-    uint64_t* tri_counts,
-    bool* is_active,
-    bool* just_deleted,
-    uint32_t edge_count
+    const uint32_t* edge_m, const uint32_t* adj_m,
+    const uint32_t* undir_node_index, const uint32_t* undir_adj,
+    const uint32_t* undir_edge_id, double* tri_counts, // <-- NOW DOUBLE
+    bool* is_active, bool* just_deleted, uint32_t edge_count
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= edge_count) return;
@@ -355,45 +435,47 @@ __global__ void updater_kernel(
     uint32_t u = edge_m[i];
     uint32_t v = adj_m[i];
 
-    // Grab the start and end pointers for u and v's neighborhood lists in VRAM
-    uint32_t ptr_u = node_index[u];
-    uint32_t end_u = node_index[u+1];
-    
-    uint32_t ptr_v = node_index[v];
-    uint32_t end_v = node_index[v+1];
+    uint32_t ptr_u = undir_node_index[u];
+    uint32_t end_u = undir_node_index[u+1];
+    uint32_t ptr_v = undir_node_index[v];
+    uint32_t end_v = undir_node_index[v+1];
 
-    // >>> THE WARP DIVERGENCE ZONE <<<
-    // 2-Pointer Intersection to find common neighbor w
+    double deg_u = (double)(end_u - ptr_u);
+    double deg_v = (double)(end_v - ptr_v);
+
     while (ptr_u < end_u && ptr_v < end_v) {
-        uint32_t w_u = adj_m[ptr_u];
-        uint32_t w_v = adj_m[ptr_v];
+        uint32_t w_u = undir_adj[ptr_u];
+        uint32_t w_v = undir_adj[ptr_v];
 
         if (w_u == w_v) {
-            // We found a triangle (u, v, w)! 
-            // Because of CSR, ptr_u and ptr_v are the EXACT indices for edges (u,w) and (v,w)
-            
-            // Atomically decrement edge (u,w) if it's still alive
-            if (is_active[ptr_u] && tri_counts[ptr_u] > 0) {
-                atomicAdd((unsigned long long int*)&tri_counts[ptr_u], -1ULL);
-            }
-            // Atomically decrement edge (v,w) using 64-bit 2's complement addition
-            if (is_active[ptr_v] && tri_counts[ptr_v] > 0) {
-                atomicAdd((unsigned long long int*)&tri_counts[ptr_v], -1ULL);
-            }
-            
-            ptr_u++;
-            ptr_v++;
-        } 
-        else if (w_u < w_v) {
-            ptr_u++;
-        } 
-        else {
-            ptr_v++;
-        }
-    }
+            uint32_t id_uw = undir_edge_id[ptr_u]; 
+            uint32_t id_vw = undir_edge_id[ptr_v]; 
 
-    // Reset the flag so we don't double-subtract in the next loop!
-    just_deleted[i] = false; 
+            // Calculate the exact fractional weight of this dying triangle
+            double deg_w = (double)(undir_node_index[w_u+1] - undir_node_index[w_u]);
+            double decrement_weight = 1.0 / (deg_u * deg_v * deg_w);
+
+            bool a_active = is_active[id_uw];
+            bool a_just_dead = just_deleted[id_uw];
+            bool b_active = is_active[id_vw];
+            bool b_just_dead = just_deleted[id_vw];
+
+            // Use atomicAdd to subtract the fraction!
+            if (a_active) {
+                if (b_active || (b_just_dead && i < id_vw)) {
+                    atomicAdd(&tri_counts[id_uw], -decrement_weight);
+                }
+            }
+            if (b_active) {
+                if (a_active || (a_just_dead && i < id_uw)) {
+                    atomicAdd(&tri_counts[id_vw], -decrement_weight);
+                }
+            }
+            ptr_u++; ptr_v++;
+        } 
+        else if (w_u < w_v) ptr_u++;
+        else ptr_v++;
+    }
 }
 
 
@@ -500,9 +582,9 @@ uint64_t tricount_gpu(uint64_t part_num, uint32_t *adj, const uint64_t *adj_coun
             // >>> HETEROGENEOUS HANDOFF: LAUNCH NATIVE GPU PEELING <<<
             // ====================================================================
             if (m == 0 && n == 0) { // Ensures this fires on the primary graph
-                float eps = 0.1f;
+                double eps = 0.1;
                 // Launch the wrapper we built earlier!
-                execute_gpu_peeling(edge_m_dev, adj_m_dev, node_index_m_dev, dev_results, adj_count_m, eps);
+                execute_gpu_peeling(edge_m_dev, adj_m_dev, node_index_m_dev, dev_results, adj_count_m, node_split[1], eps);
             }
             // ====================================================================
 
@@ -519,15 +601,102 @@ uint64_t tricount_gpu(uint64_t part_num, uint32_t *adj, const uint64_t *adj_coun
     }
     return all_sum;
 }
+
+// =========================================================================
+// >>> DIAGNOSTIC: EXACT INTEGER TRIANGLE COUNTER <<<
+// =========================================================================
+__global__ void verify_integer_triangles_kernel(
+    const uint32_t* edge_m, const uint32_t* adj_m,
+    const uint32_t* undir_node_index, const uint32_t* undir_adj,
+    const uint32_t* undir_edge_id, const bool* is_active, 
+    uint32_t edge_count, unsigned long long* total_integer_triangles
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= edge_count) return;
+    
+    // If this edge died during peeling, it cannot be part of a surviving triangle
+    if (!is_active[i]) return; 
+
+    uint32_t u = edge_m[i];
+    uint32_t v = adj_m[i];
+
+    uint32_t ptr_u = undir_node_index[u];
+    uint32_t end_u = undir_node_index[u+1];
+    uint32_t ptr_v = undir_node_index[v];
+    uint32_t end_v = undir_node_index[v+1];
+
+    unsigned long long local_count = 0;
+
+    while (ptr_u < end_u && ptr_v < end_v) {
+        uint32_t w_u = undir_adj[ptr_u];
+        uint32_t w_v = undir_adj[ptr_v];
+
+        if (w_u == w_v) {
+            uint32_t id_uw = undir_edge_id[ptr_u];
+            uint32_t id_vw = undir_edge_id[ptr_v];
+            
+            // A triangle only survives if ALL THREE of its edges survived the cascade!
+            if (is_active[id_uw] && is_active[id_vw]) {
+                local_count++;
+            }
+            ptr_u++; ptr_v++;
+        } 
+        else if (w_u < w_v) ptr_u++;
+        else ptr_v++;
+    }
+    
+    if (local_count > 0) {
+        atomicAdd(total_integer_triangles, local_count);
+    }
+}
+
 void execute_gpu_peeling(
     const uint32_t* dev_edge_m,
     const uint32_t* dev_adj_m,
     const uint32_t* dev_node_index,
     uint64_t* dev_tri_counts,
     uint32_t edge_count,
-    float eps
+    uint32_t node_count,
+    double eps
 ) {
     printf("\n>>> INITIATING PURE GPU PEELING LOOP <<<\n");
+    
+    // --- DEFINE GRID FIRST SO KERNELS CAN USE IT ---
+    int threads = 512;
+    int blocks = (edge_count + threads - 1) / threads;
+
+    // --- OPTION A: CPU BUILDER TO GPU TRANSFER ---
+    uint32_t *host_undir_node_index, *host_undir_adj, *host_undir_edge_id;
+    
+    // We need the DAG arrays back on the host to build the map
+    uint32_t* host_dag_edge_m = (uint32_t*)malloc(edge_count * sizeof(uint32_t));
+    uint32_t* host_dag_adj_m = (uint32_t*)malloc(edge_count * sizeof(uint32_t));
+    CUDA_TRY(cudaMemcpy(host_dag_edge_m, dev_edge_m, edge_count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_TRY(cudaMemcpy(host_dag_adj_m, dev_adj_m, edge_count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    build_undirected_csr_cpu(host_dag_edge_m, host_dag_adj_m, edge_count, node_count, 
+                             &host_undir_node_index, &host_undir_adj, &host_undir_edge_id);
+
+    // Allocate VRAM for the Undirected Arrays
+    uint32_t *dev_undir_node_index, *dev_undir_adj, *dev_undir_edge_id;
+    CUDA_TRY(cudaMalloc((void**)&dev_undir_node_index, (node_count + 1) * sizeof(uint32_t)));
+    CUDA_TRY(cudaMalloc((void**)&dev_undir_adj, 2 * edge_count * sizeof(uint32_t)));
+    CUDA_TRY(cudaMalloc((void**)&dev_undir_edge_id, 2 * edge_count * sizeof(uint32_t)));
+
+    // Push across the PCIe bus
+    CUDA_TRY(cudaMemcpy(dev_undir_node_index, host_undir_node_index, (node_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_TRY(cudaMemcpy(dev_undir_adj, host_undir_adj, 2 * edge_count * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_TRY(cudaMemcpy(dev_undir_edge_id, host_undir_edge_id, 2 * edge_count * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    // --- INITIALIZE EXACT PER-EDGE WEIGHTS ---
+    double* dev_exact_tri_counts;
+    CUDA_TRY(cudaMalloc((void**)&dev_exact_tri_counts, edge_count * sizeof(double)));
+
+    printf(">>> GPU: Initializing Exact Per-Edge Triangle Weights...\n");
+    init_exact_weights_kernel<<<blocks, threads>>>(
+        dev_edge_m, dev_adj_m, dev_undir_node_index, dev_undir_adj, dev_exact_tri_counts, edge_count
+    );
+    CUDA_TRY(cudaDeviceSynchronize());
 
     bool *dev_is_active, *dev_just_deleted, *dev_changed;
     CUDA_TRY(cudaMalloc((void**)&dev_is_active, edge_count * sizeof(bool)));
@@ -536,9 +705,6 @@ void execute_gpu_peeling(
 
     CUDA_TRY(cudaMemset(dev_is_active, 1, edge_count * sizeof(bool)));
     CUDA_TRY(cudaMemset(dev_just_deleted, 0, edge_count * sizeof(bool)));
-
-    int threads = 512;
-    int blocks = (edge_count + threads - 1) / threads;
 
     bool host_changed = true;
     int iteration = 0;
@@ -550,7 +716,7 @@ void execute_gpu_peeling(
         CUDA_TRY(cudaMemcpy(dev_changed, &host_changed, sizeof(bool), cudaMemcpyHostToDevice));
 
         checker_kernel<<<blocks, threads>>>(
-            dev_edge_m, dev_adj_m, dev_node_index, dev_tri_counts, dev_is_active, dev_just_deleted, eps, edge_count, dev_changed
+            dev_edge_m, dev_adj_m, dev_undir_node_index, dev_exact_tri_counts, dev_is_active, dev_just_deleted, eps, edge_count, dev_changed
         );
         CUDA_TRY(cudaDeviceSynchronize());
 
@@ -558,14 +724,19 @@ void execute_gpu_peeling(
 
         if (host_changed) {
             updater_kernel<<<blocks, threads>>>(
-                dev_edge_m, dev_adj_m, dev_node_index, dev_tri_counts, dev_is_active, dev_just_deleted, edge_count
+                dev_edge_m, dev_adj_m, dev_undir_node_index, dev_undir_adj, dev_undir_edge_id, dev_exact_tri_counts, dev_is_active, dev_just_deleted, edge_count
             );
             CUDA_TRY(cudaDeviceSynchronize());
+            
+            // >>> THE FIX: Safely wipe the flags globally after all warps have finished! <<<
+            CUDA_TRY(cudaMemset(dev_just_deleted, 0, edge_count * sizeof(bool)));
+
             printf("Iteration %d: Masked edges virtually deleted. Cascading updates triggered.\n", iteration);
         } else {
             printf("Iteration %d: Graph stabilized. Peeling complete.\n", iteration);
         }
     }
+    
     thrust::device_ptr<bool> mask_ptr(dev_is_active);
     int surviving_edges = thrust::count(mask_ptr, mask_ptr + edge_count, true);
     int deleted_edges = edge_count - surviving_edges;
@@ -574,9 +745,76 @@ void execute_gpu_peeling(
     printf("Original Edges: %u\n", edge_count);
     printf("Deleted Edges:  %d\n", deleted_edges);
     printf("Surviving Edges: %d\n", surviving_edges);
+    
+//     // ====================================================================
+//     // >>> VERIFICATION: EXACT SURVIVING FRACTIONAL WEIGHT <<<
+//     // ====================================================================
+//     bool* host_is_active = (bool*)malloc(edge_count * sizeof(bool));
+    
+//     // 1. MUST BE ALLOCATED AS DOUBLE!
+//     double* host_tri_counts = (double*)malloc(edge_count * sizeof(double)); 
+    
+//     CUDA_TRY(cudaMemcpy(host_is_active, dev_is_active, edge_count * sizeof(bool), cudaMemcpyDeviceToHost));
+//     CUDA_TRY(cudaMemcpy(host_tri_counts, dev_exact_tri_counts, edge_count * sizeof(double), cudaMemcpyDeviceToHost));
+
+//     // 2. MUST BE SUMMED AS A DOUBLE!
+//     double surviving_weight_sum = 0.0; 
+//     for (uint32_t i = 0; i < edge_count; i++) {
+//         if (host_is_active[i]) {
+//             surviving_weight_sum += host_tri_counts[i];
+//         }
+//     }
+    
+//     // Each triangle's fractional weight is shared by 3 edges
+//     printf("Total fractional triangle weight, post cleaning = %f\n", surviving_weight_sum / 3.0);
+//     printf("----------------------------------\n\n");
+
+//     free(host_is_active);
+//     free(host_tri_counts);
+//     free(host_dag_edge_m);
+//     free(host_dag_adj_m);
+
+//     CUDA_TRY(cudaFree(dev_is_active));
+//     CUDA_TRY(cudaFree(dev_just_deleted));
+//     CUDA_TRY(cudaFree(dev_changed));
+//     CUDA_TRY(cudaFree(dev_exact_tri_counts));
+//     CUDA_TRY(cudaFree(dev_undir_node_index));
+//     CUDA_TRY(cudaFree(dev_undir_adj));
+//     CUDA_TRY(cudaFree(dev_undir_edge_id));
+// }
+
+// ====================================================================
+    // >>> VERIFICATION: EXACT SURVIVING INTEGER TRIANGLES <<<
+    // ====================================================================
+    unsigned long long* dev_total_integer_triangles;
+    CUDA_TRY(cudaMalloc((void**)&dev_total_integer_triangles, sizeof(unsigned long long)));
+    CUDA_TRY(cudaMemset(dev_total_integer_triangles, 0, sizeof(unsigned long long)));
+
+    printf(">>> GPU: Running Diagnostic Integer Triangle Scan...\n");
+    verify_integer_triangles_kernel<<<blocks, threads>>>(
+        dev_edge_m, dev_adj_m, dev_undir_node_index, dev_undir_adj, dev_undir_edge_id, dev_is_active, edge_count, dev_total_integer_triangles
+    );
+    CUDA_TRY(cudaDeviceSynchronize());
+
+    unsigned long long host_total_integer_triangles = 0;
+    CUDA_TRY(cudaMemcpy(&host_total_integer_triangles, dev_total_integer_triangles, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+
+    // Because we iterate over all edges, every surviving triangle is counted exactly 3 times (once by each of its 3 edges).
+    unsigned long long exact_surviving_triangles = host_total_integer_triangles / 3;
+
+    printf("Total integer triangle count, post cleaning = %llu\n", exact_surviving_triangles);
     printf("----------------------------------\n\n");
 
+    CUDA_TRY(cudaFree(dev_total_integer_triangles));
+    
+    // --- FREE REMAINING VRAM ---
+    free(host_dag_edge_m);
+    free(host_dag_adj_m);
     CUDA_TRY(cudaFree(dev_is_active));
     CUDA_TRY(cudaFree(dev_just_deleted));
     CUDA_TRY(cudaFree(dev_changed));
+    CUDA_TRY(cudaFree(dev_exact_tri_counts));
+    CUDA_TRY(cudaFree(dev_undir_node_index));
+    CUDA_TRY(cudaFree(dev_undir_adj));
+    CUDA_TRY(cudaFree(dev_undir_edge_id));
 }
