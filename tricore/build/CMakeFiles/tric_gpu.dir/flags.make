@@ -7,11 +7,11 @@ CUDA_DEFINES =
 
 CUDA_INCLUDES = --options-file CMakeFiles/tric_gpu.dir/includes_CUDA.rsp
 
-CUDA_FLAGS = -O3 -DNDEBUG -std=c++14 "--generate-code=arch=compute_52,code=[compute_52,sm_52]" -O2 -arch=native
+CUDA_FLAGS = -std=c++17 "--generate-code=arch=compute_52,code=[compute_52,sm_52]" -O2 --extended-lambda --expt-relaxed-constexpr -DSM_TARGET=86
 
 CXX_DEFINES = 
 
-CXX_INCLUDES = -I/home/whydoiexist/Documents/RP/Code/RTRExtractor_GPU/tricore/include -I/home/whydoiexist/Documents/RP/Code/RTRExtractor_GPU/tricore/externals/gunrock -I/home/whydoiexist/Documents/RP/Code/RTRExtractor_GPU/tricore/externals/gunrock/externals/cub
+CXX_INCLUDES = -I/home/whydoiexist/Documents/RP/Code/RTRExtractor_GPU/tricore/include
 
-CXX_FLAGS = -O3 -DNDEBUG -std=gnu++14 -O2 -fopenmp
+CXX_FLAGS = -std=gnu++17 -O2 -fopenmp
 

@@ -1,0 +1,1 @@
+/usr/lib/nvidia-cuda-toolkit/bin/g++ @CMakeFiles/color.dir/objects1.rsp CMakeFiles/color.dir/cmake_device_link.o -o ../../../bin/color @CMakeFiles/color.dir/linkLibs.rsp -L"/usr/lib/x86_64-linux-gnu/stubs" -L"/usr/lib/x86_64-linux-gnu"

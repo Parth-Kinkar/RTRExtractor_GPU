@@ -1,0 +1,1 @@
+  -L"/usr/lib/gcc/x86_64-linux-gnu/13"  -lcurand -lcuda -lcusparse -lstdc++fs -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

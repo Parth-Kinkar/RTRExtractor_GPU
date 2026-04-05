@@ -1,0 +1,1 @@
+/usr/lib/nvidia-cuda-toolkit/bin/g++ @CMakeFiles/diamond.dir/objects1.rsp CMakeFiles/diamond.dir/cmake_device_link.o -o ../../bin/diamond @CMakeFiles/diamond.dir/linkLibs.rsp -L"/usr/lib/x86_64-linux-gnu/stubs" -L"/usr/lib/x86_64-linux-gnu"

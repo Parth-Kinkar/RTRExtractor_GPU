@@ -1,0 +1,1 @@
+/usr/lib/nvidia-cuda-toolkit/bin/g++ @CMakeFiles/hits.dir/objects1.rsp CMakeFiles/hits.dir/cmake_device_link.o -o ../../../bin/hits @CMakeFiles/hits.dir/linkLibs.rsp -L"/usr/lib/x86_64-linux-gnu/stubs" -L"/usr/lib/x86_64-linux-gnu"

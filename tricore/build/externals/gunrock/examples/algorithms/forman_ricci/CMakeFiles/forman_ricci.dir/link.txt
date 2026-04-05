@@ -1,0 +1,1 @@
+/usr/lib/nvidia-cuda-toolkit/bin/g++ @CMakeFiles/forman_ricci.dir/objects1.rsp CMakeFiles/forman_ricci.dir/cmake_device_link.o -o ../../../bin/forman_ricci @CMakeFiles/forman_ricci.dir/linkLibs.rsp -L"/usr/lib/x86_64-linux-gnu/stubs" -L"/usr/lib/x86_64-linux-gnu"

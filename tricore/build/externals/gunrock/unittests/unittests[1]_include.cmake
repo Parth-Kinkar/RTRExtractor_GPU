@@ -1,0 +1,5 @@
+if(EXISTS "/home/whydoiexist/Documents/RP/Code/RTRExtractor_GPU/tricore/build/externals/gunrock/unittests/unittests[1]_tests.cmake")
+  include("/home/whydoiexist/Documents/RP/Code/RTRExtractor_GPU/tricore/build/externals/gunrock/unittests/unittests[1]_tests.cmake")
+else()
+  add_test(unittests_NOT_BUILT unittests_NOT_BUILT)
+endif()
