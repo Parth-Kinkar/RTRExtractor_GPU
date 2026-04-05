@@ -1,0 +1,3 @@
+/home/whydoiexist/Documents/RP/Code/RTRExtractor_GPU/tricore/build/CMakeFiles/tric_gpu.dir
+/home/whydoiexist/Documents/RP/Code/RTRExtractor_GPU/tricore/build/CMakeFiles/edit_cache.dir
+/home/whydoiexist/Documents/RP/Code/RTRExtractor_GPU/tricore/build/CMakeFiles/rebuild_cache.dir
