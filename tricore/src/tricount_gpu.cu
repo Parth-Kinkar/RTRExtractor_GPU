@@ -318,6 +318,20 @@ __global__ void init_exact_weights_kernel(
     exact_tri_counts[i] = weight_sum;
 }
 
+__global__ void init_vertex_weights_kernel(
+    const uint32_t* edge_m, const uint32_t* adj_m, const double* tri_counts,
+    double* vertex_weights, uint32_t edge_count
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= edge_count) return;
+    
+    double w = tri_counts[i] / 2.0; 
+    if (w > 0) {
+        atomicAdd(&vertex_weights[edge_m[i]], w);
+        atomicAdd(&vertex_weights[adj_m[i]], w);
+    }
+}
+
 __global__ void checker_kernel(
     const uint32_t* edge_m, const uint32_t* adj_m, const uint32_t* node_index, const double* tri_counts,
     bool* is_active, bool* just_deleted, double eps, uint32_t edge_count, bool* d_changed
@@ -338,7 +352,7 @@ __global__ void checker_kernel(
 
 __global__ void updater_kernel(
     const uint32_t* edge_m, const uint32_t* adj_m, const uint32_t* undir_node_index, const uint32_t* undir_adj,
-    const uint32_t* undir_edge_id, double* tri_counts, bool* is_active, bool* just_deleted, uint32_t edge_count
+    const uint32_t* undir_edge_id, double* tri_counts, double* vertex_weights, bool* is_active, bool* just_deleted, uint32_t edge_count
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= edge_count) return;
@@ -357,11 +371,24 @@ __global__ void updater_kernel(
             uint32_t id_uw = undir_edge_id[ptr_u]; uint32_t id_vw = undir_edge_id[ptr_v]; 
             double deg_w = (double)(undir_node_index[w_u+1] - undir_node_index[w_u]);
             double decrement_weight = 1.0 / (deg_u * deg_v * deg_w);
+            
             bool a_act = is_active[id_uw]; bool a_dead = just_deleted[id_uw];
             bool b_act = is_active[id_vw]; bool b_dead = just_deleted[id_vw];
 
             if (a_act) { if (b_act || (b_dead && i < id_vw)) { atomicAdd(&tri_counts[id_uw], -decrement_weight); } }
             if (b_act) { if (a_act || (a_dead && i < id_uw)) { atomicAdd(&tri_counts[id_vw], -decrement_weight); } }
+            
+            // THE MATH FIX: Update the perVertex weights exactly once per destroyed triangle
+            bool i_am_responsible = true;
+            if (a_dead && id_uw < i) i_am_responsible = false;
+            if (b_dead && id_vw < i) i_am_responsible = false;
+
+            if (i_am_responsible) {
+                atomicAdd(&vertex_weights[u], -decrement_weight);
+                atomicAdd(&vertex_weights[v], -decrement_weight);
+                atomicAdd(&vertex_weights[w_u], -decrement_weight);
+            }
+            
             ptr_u++; ptr_v++;
         } 
         else if (w_u < w_v) ptr_u++;
@@ -500,36 +527,69 @@ __global__ void get_2hop_candidates_kernel(
     }
 }
 
-__global__ void compute_tu_and_degree_kernel(
+__global__ void compute_fractional_weights_kernel(
     const uint32_t* candidates, uint32_t num_candidates,
     const uint32_t* frontier, uint32_t frontier_size,
     const uint32_t* node_index, const uint32_t* adj, const uint32_t* edge_id, const bool* is_active,
-    uint32_t* tu_array, uint32_t* degree_array
+    double* tu_weight_array, double* vertex_weight_array, const double* global_vertex_weights
 ) {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_candidates) return;
 
-    uint32_t u = candidates[tid];
-    uint32_t start = node_index[u];
-    uint32_t end = node_index[u+1];
+    uint32_t x = candidates[tid];
+    uint32_t start_x = node_index[x];
+    uint32_t end_x = node_index[x+1];
     
-    uint32_t active_deg = 0;
-    uint32_t tu = 0;
-    for(uint32_t i = start; i < end; i++) {
+    double tu_wgt = 0.0;
+    double deg_x = (double)(end_x - start_x);
+
+    // 1. Find all connections from candidate to the 1-hop frontier
+    uint32_t f_conn[64]; 
+    uint32_t f_count = 0;
+    
+    for(uint32_t i = start_x; i < end_x; i++) {
         if (is_active[edge_id[i]]) { 
-            active_deg++;
             uint32_t v = adj[i];
             int L = 0, R = frontier_size - 1;
             while(L <= R) {
                 int M = L + (R - L) / 2;
-                if (frontier[M] == v) { tu++; break; }
+                if (frontier[M] == v) { 
+                    if (f_count < 64) f_conn[f_count++] = v;
+                    break; 
+                }
                 if (frontier[M] < v) L = M + 1;
                 else R = M - 1;
             }
         }
     }
-    degree_array[tid] = active_deg;
-    tu_array[tid] = tu;
+    
+    // 2. THE MATH FIX: Find closed triangles (x, v, w) within the frontier
+    for (uint32_t i = 0; i < f_count; i++) {
+        uint32_t v = f_conn[i];
+        double deg_v = (double)(node_index[v+1] - node_index[v]);
+        
+        for (uint32_t j = i + 1; j < f_count; j++) {
+            uint32_t w = f_conn[j];
+            double deg_w = (double)(node_index[w+1] - node_index[w]);
+            
+            // Binary search to see if frontier nodes v and w are connected
+            uint32_t L = node_index[v], R = node_index[v+1] - 1;
+            while (L <= R) {
+                uint32_t M = L + (R - L) / 2;
+                if (adj[M] == w) {
+                    if (is_active[edge_id[M]]) {
+                        tu_wgt += 1.0 / (deg_x * deg_v * deg_w);
+                    }
+                    break;
+                }
+                if (adj[M] < w) L = M + 1;
+                else R = M - 1;
+            }
+        }
+    }
+    
+    tu_weight_array[tid] = tu_wgt;
+    vertex_weight_array[tid] = global_vertex_weights[x];
 }
 
 __global__ void mask_cluster_kernel(
@@ -555,108 +615,109 @@ __global__ void mask_cluster_kernel(
 
 struct ZipComp {
     __host__ __device__
-    bool operator()(const thrust::tuple<uint32_t, uint32_t, uint32_t>& a, 
-                    const thrust::tuple<uint32_t, uint32_t, uint32_t>& b) const {
+    bool operator()(const thrust::tuple<uint32_t, double, double>& a, 
+                    const thrust::tuple<uint32_t, double, double>& b) const {
         if (thrust::get<1>(a) == thrust::get<1>(b)) return thrust::get<2>(a) < thrust::get<2>(b); 
         return thrust::get<1>(a) > thrust::get<1>(b); 
     }
 };
 
 struct RatioFunctor {
+    double internalWgt;
+    double potentialWgt;
+    
+    RatioFunctor(double iw, double pw) : internalWgt(iw), potentialWgt(pw) {}
+
     __host__ __device__
-    double operator()(const thrust::tuple<uint32_t, uint32_t>& a) const {
-        double num = thrust::get<0>(a);
-        double den = thrust::get<1>(a);
-        return num / (den + 1e-9);
+    double operator()(const thrust::tuple<double, double>& a) const {
+        double num_sum = thrust::get<0>(a);
+        double den_sum = thrust::get<1>(a);
+        return (internalWgt + num_sum) / (internalWgt + potentialWgt + den_sum + 1e-9);
     }
 };
 
 struct MemoryPool {
     uint32_t* dev_frontier;
-    uint32_t* dev_frontier_count;
+    uint32_t* pinned_frontier_count; // CPU visible
+    uint32_t* dev_frontier_count;    // GPU mapped
+    
     uint32_t* dev_candidates;
-    uint32_t* dev_candidate_count;
-    uint32_t* dev_tu;
-    uint32_t* dev_degree;
+    uint32_t* pinned_candidate_count; // CPU visible
+    uint32_t* dev_candidate_count;    // GPU mapped
+
     double* dev_ratios;
+
+    bool* pinned_clustered;      // CPU visible tracker
+    bool* dev_mapped_clustered;  // GPU mapped tracker
+
+    double* dev_tu_weight;
+    double* dev_vertex_weight;
+    double* pinned_vertex_weights;
 };
 
 // =========================================================================
-// >>> PHASE 2: HYBRID CUDA CLUSTER EXTRACTION & GREEDY SWEEP <<<
+// >>> PHASE 2: ZERO-COPY HYBRID CLUSTER EXTRACTION <<<
 // =========================================================================
 
 uint32_t extract_cluster_gunrock(
     uint32_t seed_node, uint32_t seed_deg, const uint32_t* dev_undir_node_index, const uint32_t* dev_undir_adj,
     const uint32_t* dev_undir_edge_id, bool* dev_is_active, bool* dev_just_deleted,
-    uint32_t node_count, double eps, std::vector<bool>& host_clustered, Profiler& prof, MemoryPool& pool
+    uint32_t node_count, double eps, Profiler& prof, MemoryPool& pool, const double* global_vertex_weights
 ) {
-    // 1. We deleted the start/end cudaMemcpy! We just use seed_deg.
     uint32_t max_possible = seed_deg;
     if (max_possible == 0) {
-        host_clustered[seed_node] = true;
+        pool.pinned_clustered[seed_node] = true;
         return 1;
     }
 
     auto t_start = std::chrono::high_resolution_clock::now();
-    uint32_t* dev_frontier = pool.dev_frontier;
-    uint32_t* dev_frontier_count = pool.dev_frontier_count;
-    CUDA_TRY(cudaMemset(dev_frontier_count, 0, sizeof(uint32_t)));
+    *pool.pinned_frontier_count = 0; 
     auto t_end = std::chrono::high_resolution_clock::now();
-    prof.vram_alloc_time += std::chrono::duration<double>(t_end - t_start).count();
+    prof.cpu_compute_time += std::chrono::duration<double>(t_end - t_start).count();
 
     t_start = std::chrono::high_resolution_clock::now();
     int threads = 256;
     int blocks = (max_possible + threads - 1) / threads;
     if (blocks > 0) {
-        get_active_frontier_kernel<<<blocks, threads>>>(seed_node, seed_deg, eps, dev_undir_node_index, dev_undir_adj, dev_undir_edge_id, dev_is_active, dev_frontier, dev_frontier_count);
+        get_active_frontier_kernel<<<blocks, threads>>>(seed_node, seed_deg, eps, dev_undir_node_index, dev_undir_adj, dev_undir_edge_id, dev_is_active, pool.dev_frontier, pool.dev_frontier_count);
         CUDA_TRY(cudaDeviceSynchronize());
     }
     t_end = std::chrono::high_resolution_clock::now();
     prof.gpu_compute_time += std::chrono::duration<double>(t_end - t_start).count();
 
-    t_start = std::chrono::high_resolution_clock::now();
-    uint32_t num_neighbors = 0;
-    CUDA_TRY(cudaMemcpy(&num_neighbors, dev_frontier_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    t_end = std::chrono::high_resolution_clock::now();
-    prof.pcie_transfer_time += std::chrono::duration<double>(t_end - t_start).count();
+    uint32_t num_neighbors = *pool.pinned_frontier_count;
 
     if (num_neighbors == 0) {
-        host_clustered[seed_node] = true;
+        pool.pinned_clustered[seed_node] = true;
         return 1;
     }
 
     t_start = std::chrono::high_resolution_clock::now();
-    thrust::device_ptr<uint32_t> t_front(dev_frontier);
+    thrust::device_ptr<uint32_t> t_front(pool.dev_frontier);
     thrust::sort(t_front, t_front + num_neighbors);
     t_end = std::chrono::high_resolution_clock::now();
     prof.gpu_compute_time += std::chrono::duration<double>(t_end - t_start).count();
 
     t_start = std::chrono::high_resolution_clock::now();
-    uint32_t max_candidates = 50000000; 
-    uint32_t* dev_candidates = pool.dev_candidates;
-    uint32_t* dev_candidate_count = pool.dev_candidate_count;
-    CUDA_TRY(cudaMemset(dev_candidate_count, 0, sizeof(uint32_t)));
+    *pool.pinned_candidate_count = 0;
     t_end = std::chrono::high_resolution_clock::now();
-    prof.vram_alloc_time += std::chrono::duration<double>(t_end - t_start).count();
+    prof.cpu_compute_time += std::chrono::duration<double>(t_end - t_start).count();
 
     t_start = std::chrono::high_resolution_clock::now();
+    uint32_t max_candidates = 50000000; 
     blocks = (num_neighbors + threads - 1) / threads;
     get_2hop_candidates_kernel<<<blocks, threads>>>(
         seed_deg, eps, dev_undir_node_index, dev_undir_adj, dev_undir_edge_id, dev_is_active, 
-        thrust::raw_pointer_cast(t_front), num_neighbors, dev_candidates, dev_candidate_count, max_candidates
+        thrust::raw_pointer_cast(t_front), num_neighbors, pool.dev_candidates, pool.dev_candidate_count, max_candidates
     );
     CUDA_TRY(cudaDeviceSynchronize());
     t_end = std::chrono::high_resolution_clock::now();
     prof.gpu_compute_time += std::chrono::duration<double>(t_end - t_start).count();
 
-    t_start = std::chrono::high_resolution_clock::now();
-    uint32_t total_raw_candidates = 0;
-    CUDA_TRY(cudaMemcpy(&total_raw_candidates, dev_candidate_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    t_end = std::chrono::high_resolution_clock::now();
-    prof.pcie_transfer_time += std::chrono::duration<double>(t_end - t_start).count();
+    uint32_t total_raw_candidates = *pool.pinned_candidate_count;
 
     t_start = std::chrono::high_resolution_clock::now();
-    thrust::device_ptr<uint32_t> cand_ptr(dev_candidates);
+    thrust::device_ptr<uint32_t> cand_ptr(pool.dev_candidates);
     thrust::sort(cand_ptr, cand_ptr + total_raw_candidates);
     auto new_end = thrust::unique(cand_ptr, cand_ptr + total_raw_candidates);
     uint32_t unique_candidate_count = new_end - cand_ptr;
@@ -667,33 +728,38 @@ uint32_t extract_cluster_gunrock(
 
     if (unique_candidate_count > 0) {
         t_start = std::chrono::high_resolution_clock::now();
-        uint32_t* dev_tu = pool.dev_tu;
-        uint32_t* dev_degree = pool.dev_degree;
-        t_end = std::chrono::high_resolution_clock::now();
-        prof.vram_alloc_time += std::chrono::duration<double>(t_end - t_start).count();
-
-        t_start = std::chrono::high_resolution_clock::now();
         int cand_blocks = (unique_candidate_count + threads - 1) / threads;
-        compute_tu_and_degree_kernel<<<cand_blocks, threads>>>(
+        
+        // Use the fractional kernel and double precision arrays
+        compute_fractional_weights_kernel<<<cand_blocks, threads>>>(
             thrust::raw_pointer_cast(cand_ptr), unique_candidate_count,
             thrust::raw_pointer_cast(t_front), num_neighbors,
-            dev_undir_node_index, dev_undir_adj, dev_undir_edge_id, dev_is_active, dev_tu, dev_degree
+            dev_undir_node_index, dev_undir_adj, dev_undir_edge_id, dev_is_active, 
+            pool.dev_tu_weight, pool.dev_vertex_weight, global_vertex_weights
         );
         CUDA_TRY(cudaDeviceSynchronize());
         
-        auto tu_dptr = thrust::device_pointer_cast(pool.dev_tu);
-        auto deg_dptr = thrust::device_pointer_cast(pool.dev_degree);
+        auto tu_dptr = thrust::device_pointer_cast(pool.dev_tu_weight);
+        auto deg_dptr = thrust::device_pointer_cast(pool.dev_vertex_weight);
 
         auto zip_start = thrust::make_zip_iterator(thrust::make_tuple(cand_ptr, tu_dptr, deg_dptr));
         auto zip_end = zip_start + unique_candidate_count;
         thrust::sort(zip_start, zip_end, ZipComp());
+
+        // Derive potentialWgt natively on GPU via reduction
+        double potentialWgt = thrust::reduce(tu_dptr, tu_dptr + unique_candidate_count, 0.0);
+        
+        // THE MATH FIX: Read the exact seed density from Pinned Memory
+        double internalWgt = pool.pinned_vertex_weights[seed_node]; 
 
         thrust::inclusive_scan(tu_dptr, tu_dptr + unique_candidate_count, tu_dptr);
         thrust::inclusive_scan(deg_dptr, deg_dptr + unique_candidate_count, deg_dptr);
 
         auto ratios_dptr = thrust::device_pointer_cast(pool.dev_ratios);
         auto zip_scans = thrust::make_zip_iterator(thrust::make_tuple(tu_dptr, deg_dptr));
-        thrust::transform(zip_scans, zip_scans + unique_candidate_count, ratios_dptr, RatioFunctor());
+        
+        // Pass weights into the upgraded Functor
+        thrust::transform(zip_scans, zip_scans + unique_candidate_count, ratios_dptr, RatioFunctor(internalWgt, potentialWgt));
 
         auto max_iter = thrust::max_element(ratios_dptr, ratios_dptr + unique_candidate_count);
         max_ind = thrust::distance(ratios_dptr, max_iter);
@@ -707,25 +773,9 @@ uint32_t extract_cluster_gunrock(
         prof.gpu_compute_time += std::chrono::duration<double>(t_end - t_start).count();
     }
 
-    // --- BULK BATCHING FOR TRACKING ---
     t_start = std::chrono::high_resolution_clock::now();
-    host_clustered[seed_node] = true;
+    pool.pinned_clustered[seed_node] = true;
 
-    if (num_neighbors > 0) {
-        std::vector<uint32_t> h_front(num_neighbors);
-        CUDA_TRY(cudaMemcpy(h_front.data(), thrust::raw_pointer_cast(t_front), num_neighbors * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        for(uint32_t v : h_front) host_clustered[v] = true;
-    }
-
-    if (max_ind >= 0) {
-        std::vector<uint32_t> h_cands(max_ind + 1);
-        CUDA_TRY(cudaMemcpy(h_cands.data(), thrust::raw_pointer_cast(cand_ptr), (max_ind + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        for(uint32_t v : h_cands) host_clustered[v] = true;
-    }
-    t_end = std::chrono::high_resolution_clock::now();
-    prof.pcie_transfer_time += std::chrono::duration<double>(t_end - t_start).count();
-
-    t_start = std::chrono::high_resolution_clock::now();
     int blocks_front = (num_neighbors + threads - 1) / threads;
     if (blocks_front > 0) mask_cluster_kernel<<<blocks_front, threads>>>(thrust::raw_pointer_cast(t_front), num_neighbors, dev_undir_node_index, dev_undir_edge_id, dev_is_active, dev_just_deleted);
     CUDA_TRY(cudaDeviceSynchronize());
@@ -739,6 +789,7 @@ void execute_gpu_peeling(
     const uint32_t* dev_edge_m, const uint32_t* dev_adj_m, const uint32_t* dev_node_index,
     uint64_t* dev_tri_counts, uint32_t edge_count, uint32_t node_count, double eps
 ) {
+    MemoryPool pool;
     Profiler prof;
 
     int threads = 512; int blocks = (edge_count + threads - 1) / threads;
@@ -762,6 +813,13 @@ void execute_gpu_peeling(
     double* dev_exact_tri_counts;
     CUDA_TRY(cudaMalloc((void**)&dev_exact_tri_counts, edge_count * sizeof(double)));
 
+    double* dev_vertex_weights;
+    double* pinned_vertex_weights;
+    CUDA_TRY(cudaHostAlloc((void**)&pinned_vertex_weights, node_count * sizeof(double), cudaHostAllocMapped));
+    memset(pinned_vertex_weights, 0, node_count * sizeof(double));
+    CUDA_TRY(cudaHostGetDevicePointer((void**)&dev_vertex_weights, pinned_vertex_weights, 0));
+    pool.pinned_vertex_weights = pinned_vertex_weights; // Save it to the pool
+
     init_exact_weights_kernel<<<blocks, threads>>>(dev_edge_m, dev_adj_m, dev_undir_node_index, dev_undir_adj, dev_exact_tri_counts, edge_count);
     CUDA_TRY(cudaDeviceSynchronize());
 
@@ -780,7 +838,7 @@ void execute_gpu_peeling(
         CUDA_TRY(cudaDeviceSynchronize());
         CUDA_TRY(cudaMemcpy(&host_changed, dev_changed, sizeof(bool), cudaMemcpyDeviceToHost));
         if (host_changed) {
-            updater_kernel<<<blocks, threads>>>(dev_edge_m, dev_adj_m, dev_undir_node_index, dev_undir_adj, dev_undir_edge_id, dev_exact_tri_counts, dev_is_active, dev_just_deleted, edge_count);
+            updater_kernel<<<blocks, threads>>>(dev_edge_m, dev_adj_m, dev_undir_node_index, dev_undir_adj, dev_undir_edge_id, dev_exact_tri_counts, dev_vertex_weights, dev_just_deleted, dev_is_active, edge_count);
             CUDA_TRY(cudaDeviceSynchronize());
             CUDA_TRY(cudaMemset(dev_just_deleted, 0, edge_count * sizeof(bool)));
         }
@@ -798,30 +856,39 @@ void execute_gpu_peeling(
     auto t_end = std::chrono::high_resolution_clock::now();
     prof.cpu_compute_time += std::chrono::duration<double>(t_end - t_start).count();
 
-    // TRACKER IS BACK IN RAM
-    std::vector<bool> host_clustered(node_count, false);
-    uint32_t total_nontrivial_clustered_vertices = 0;
-
-    MemoryPool pool;
+    // --- INITIALIZE THE ZERO-COPY MEMORY POOL ---
+    
     uint32_t max_candidates = 50000000;
+    
     CUDA_TRY(cudaMalloc(&pool.dev_frontier, node_count * sizeof(uint32_t)));
-    CUDA_TRY(cudaMalloc(&pool.dev_frontier_count, sizeof(uint32_t)));
     CUDA_TRY(cudaMalloc(&pool.dev_candidates, max_candidates * sizeof(uint32_t)));
-    CUDA_TRY(cudaMalloc(&pool.dev_candidate_count, sizeof(uint32_t)));
-    CUDA_TRY(cudaMalloc(&pool.dev_tu, max_candidates * sizeof(uint32_t)));
-    CUDA_TRY(cudaMalloc(&pool.dev_degree, max_candidates * sizeof(uint32_t)));
     CUDA_TRY(cudaMalloc(&pool.dev_ratios, max_candidates * sizeof(double)));
+    CUDA_TRY(cudaMalloc(&pool.dev_tu_weight, max_candidates * sizeof(double)));
+    CUDA_TRY(cudaMalloc(&pool.dev_vertex_weight, max_candidates * sizeof(double)));
+
+    // Allocate Pinned Memory for instant Host-Device transfers
+    CUDA_TRY(cudaHostAlloc((void**)&pool.pinned_frontier_count, sizeof(uint32_t), cudaHostAllocMapped));
+    CUDA_TRY(cudaHostGetDevicePointer((void**)&pool.dev_frontier_count, pool.pinned_frontier_count, 0));
+
+    CUDA_TRY(cudaHostAlloc((void**)&pool.pinned_candidate_count, sizeof(uint32_t), cudaHostAllocMapped));
+    CUDA_TRY(cudaHostGetDevicePointer((void**)&pool.dev_candidate_count, pool.pinned_candidate_count, 0));
+
+    CUDA_TRY(cudaHostAlloc((void**)&pool.pinned_clustered, node_count * sizeof(bool), cudaHostAllocMapped));
+    memset(pool.pinned_clustered, 0, node_count * sizeof(bool));
+    CUDA_TRY(cudaHostGetDevicePointer((void**)&pool.dev_mapped_clustered, pool.pinned_clustered, 0));
+
+    uint32_t total_nontrivial_clustered_vertices = 0;
 
     for (uint32_t i = 0; i < node_count; i++) {
         uint32_t seed_node = deg_info[i].first;
         uint32_t seed_deg = deg_info[i].second;
         
-        // 1.1 MILLION CUDA_MEMCPY CALLS NUKED. INSTANT RAM CHECK.
-        if (host_clustered[seed_node]) continue;
+        // ZERO LATENCY CPU CHECK
+        if (pool.pinned_clustered[seed_node]) continue;
 
         uint32_t c_size = extract_cluster_gunrock(
             seed_node, seed_deg, dev_undir_node_index, dev_undir_adj, dev_undir_edge_id,
-            dev_is_active, dev_just_deleted, node_count, eps, host_clustered, prof, pool
+            dev_is_active, dev_just_deleted, node_count, eps, prof, pool, dev_vertex_weights
         );
         
         if (c_size > 1) {
@@ -829,10 +896,12 @@ void execute_gpu_peeling(
         }
     }
 
-    CUDA_TRY(cudaFree(pool.dev_frontier)); CUDA_TRY(cudaFree(pool.dev_frontier_count));
-    CUDA_TRY(cudaFree(pool.dev_candidates)); CUDA_TRY(cudaFree(pool.dev_candidate_count));
-    CUDA_TRY(cudaFree(pool.dev_tu)); CUDA_TRY(cudaFree(pool.dev_degree));
-    CUDA_TRY(cudaFree(pool.dev_ratios));
+    CUDA_TRY(cudaFree(pool.dev_frontier)); CUDA_TRY(cudaFreeHost(pool.pinned_frontier_count));
+    CUDA_TRY(cudaFree(pool.dev_candidates)); CUDA_TRY(cudaFreeHost(pool.pinned_candidate_count));
+    CUDA_TRY(cudaFree(pool.dev_ratios)); CUDA_TRY(cudaFreeHost(pool.pinned_clustered));
+    CUDA_TRY(cudaFreeHost(pinned_vertex_weights));
+    CUDA_TRY(cudaFree(pool.dev_tu_weight));
+    CUDA_TRY(cudaFree(pool.dev_vertex_weight));
 
     printf("\n--------------------------------------------\n");
     printf("Generating details of RTRex-example decomposition\n");
@@ -846,7 +915,7 @@ void execute_gpu_peeling(
     printf("2. PCIe Transfer Time:    %f seconds\n", prof.pcie_transfer_time);
     printf("3. GPU Compute Time:      %f seconds\n", prof.gpu_compute_time);
     printf("4. CPU Compute Time:      %f seconds\n", prof.cpu_compute_time);
-    printf("============================================\n\n");
+    printf("============================================\n\\n");
 
     free(host_dag_edge_m); free(host_dag_adj_m);
     CUDA_TRY(cudaFree(dev_is_active)); CUDA_TRY(cudaFree(dev_just_deleted)); CUDA_TRY(cudaFree(dev_changed));
