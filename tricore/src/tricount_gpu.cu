@@ -474,7 +474,7 @@ __global__ void get_active_frontier_kernel(
 }
 
 __global__ void get_2hop_candidates_kernel(
-    uint32_t seed_deg, double eps,
+    uint32_t seed_node, uint32_t seed_deg, double eps, // <-- ADDED SEED NODE
     const uint32_t* node_index, const uint32_t* adj, const uint32_t* edge_id, const bool* is_active,
     const uint32_t* frontier, uint32_t frontier_size,
     uint32_t* candidates, uint32_t* count, uint32_t max_safe_size
@@ -489,9 +489,23 @@ __global__ void get_2hop_candidates_kernel(
     for (uint32_t i = start; i < end; i++) {
         if (is_active[edge_id[i]]) {
             uint32_t v = adj[i];
+
+            // THE FIX 1: Reject the seed node natively
+            if (v == seed_node) continue;
+
+            // THE FIX 2: Reject nodes already in the 1-hop frontier (Binary Search)
+            bool in_frontier = false;
+            int L = 0, R = frontier_size - 1;
+            while (L <= R) {
+                int M = L + (R - L) / 2;
+                if (frontier[M] == v) { in_frontier = true; break; }
+                if (frontier[M] < v) L = M + 1;
+                else R = M - 1;
+            }
+            if (in_frontier) continue;
+
+            // Existing degree filter
             uint32_t deg_v = node_index[v+1] - node_index[v];
-            
-            // THE FIX: Serial Code Degree Filter
             if ((double)deg_v <= (double)seed_deg / eps) {
                 uint32_t pos = atomicAdd(count, 1);
                 if (pos < max_safe_size) candidates[pos] = v;
@@ -557,8 +571,16 @@ struct ZipComp {
     __host__ __device__
     bool operator()(const thrust::tuple<uint32_t, uint32_t, uint32_t>& a, 
                     const thrust::tuple<uint32_t, uint32_t, uint32_t>& b) const {
-        if (thrust::get<1>(a) == thrust::get<1>(b)) return thrust::get<2>(a) < thrust::get<2>(b); 
-        return thrust::get<1>(a) > thrust::get<1>(b); 
+        // 1. Highest triangle count first
+        if (thrust::get<1>(a) != thrust::get<1>(b)) 
+            return thrust::get<1>(a) > thrust::get<1>(b); 
+        
+        // 2. Lowest active degree first
+        if (thrust::get<2>(a) != thrust::get<2>(b)) 
+            return thrust::get<2>(a) < thrust::get<2>(b); 
+            
+        // 3. THE STRICT TIE-BREAKER: Lowest Node ID first
+        return thrust::get<0>(a) < thrust::get<0>(b); 
     }
 };
 
@@ -643,7 +665,7 @@ uint32_t extract_cluster_gunrock(
     uint32_t max_candidates = 50000000; 
     blocks = (num_neighbors + threads - 1) / threads;
     get_2hop_candidates_kernel<<<blocks, threads>>>(
-        seed_deg, eps, dev_undir_node_index, dev_undir_adj, dev_undir_edge_id, dev_is_active, 
+        seed_node, seed_deg, eps, dev_undir_node_index, dev_undir_adj, dev_undir_edge_id, dev_is_active, 
         thrust::raw_pointer_cast(t_front), num_neighbors, pool.dev_candidates, pool.dev_candidate_count, max_candidates
     );
     CUDA_TRY(cudaDeviceSynchronize());
@@ -689,6 +711,34 @@ uint32_t extract_cluster_gunrock(
 
         auto max_iter = thrust::max_element(ratios_dptr, ratios_dptr + unique_candidate_count);
         max_ind = thrust::distance(ratios_dptr, max_iter);
+
+        // ==========================================
+        // >>> DEBUG CHECKPOINTS FOR NODE 0 <<<
+        // ==========================================
+        if (seed_node == 0) {
+            printf("\n--- DEBUG CHECKPOINTS (NODE 0) ---\n");
+            printf("Frontier Size: %u\n", num_neighbors);
+            printf("Candidates Size: %u\n", unique_candidate_count);
+
+            std::vector<uint32_t> h_cands(unique_candidate_count);
+            std::vector<uint32_t> h_tu(unique_candidate_count);
+            std::vector<uint32_t> h_deg(unique_candidate_count);
+            std::vector<double> h_ratios(unique_candidate_count);
+
+            cudaMemcpy(h_cands.data(), thrust::raw_pointer_cast(cand_ptr), unique_candidate_count * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_tu.data(), thrust::raw_pointer_cast(tu_dptr), unique_candidate_count * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_deg.data(), thrust::raw_pointer_cast(deg_dptr), unique_candidate_count * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_ratios.data(), thrust::raw_pointer_cast(ratios_dptr), unique_candidate_count * sizeof(double), cudaMemcpyDeviceToHost);
+
+            for (uint32_t i = 0; i < unique_candidate_count; i++) {
+                printf("Cand %u: tu (intersect) = %u, active_deg = %u, ratio = %f\n", 
+                       h_cands[i], h_tu[i], h_deg[i], h_ratios[i]);
+            }
+            printf("Max Index Chosen: %d\n", max_ind);
+            printf("----------------------------------\n");
+        }
+        // ==========================================
+
 
         if (max_ind >= 0) {
             int b_cand = (max_ind + 1 + threads - 1) / threads;
